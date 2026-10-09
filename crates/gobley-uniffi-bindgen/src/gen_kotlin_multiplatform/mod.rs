@@ -1467,3 +1467,96 @@ mod filters {
         Ok(string.repeat(n))
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// Returns the declared return type of the FFI function `name` in generated JVM/Android code.
+    fn ffi_return_type<'a>(bindings: &'a str, name: &str) -> &'a str {
+        let declaration = format!("fun {name}(");
+        let start = bindings
+            .find(&declaration)
+            .unwrap_or_else(|| panic!("missing declaration of {name}"));
+        let signature = &bindings[start..];
+        let return_type = &signature[signature.find("): ").expect("missing return type") + 3..];
+        &return_type[..return_type.find('\n').unwrap_or(return_type.len())]
+    }
+
+    #[test]
+    fn unsigned_small_integers_use_int_direct_return_carriers() {
+        let mut ci = ComponentInterface::from_webidl(
+            r#"
+            namespace test_crate {
+                u8 get_u8();
+                u16 get_u16();
+                i8 get_i8();
+                i16 get_i16();
+                Port get_port();
+            };
+            [Custom]
+            typedef u16 Port;
+            "#,
+            "test_crate",
+        )
+        .unwrap();
+        ci.derive_ffi_funcs().unwrap();
+        let config = Config {
+            package_name: Some("test_crate".to_string()),
+            cdylib_name: Some("test_crate".to_string()),
+            kotlin_targets: vec![ConfigKotlinTarget::Android],
+            custom_types: HashMap::from([(
+                "Port".to_string(),
+                CustomTypeConfig {
+                    lift: "{}.toInt()".to_string(),
+                    lower: "{}.toUShort()".to_string(),
+                    ..CustomTypeConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let bindings = generate_bindings(&config, &ci)
+            .unwrap()
+            .android
+            .expect("android bindings");
+
+        // JNA direct mapping passes the native return register through unchanged, and ART's
+        // compiled JNI stubs on 32-bit ARM don't re-extend it, so a zero-extended u8/u16 must be
+        // read as Int to keep values with the high bit set intact.
+        assert_eq!(
+            ffi_return_type(&bindings, "uniffi_test_crate_fn_func_get_u8"),
+            "Int"
+        );
+        assert_eq!(
+            ffi_return_type(&bindings, "uniffi_test_crate_fn_func_get_u16"),
+            "Int"
+        );
+        assert_eq!(
+            ffi_return_type(&bindings, "uniffi_test_crate_checksum_func_get_u16"),
+            "Int"
+        );
+        assert_eq!(
+            ffi_return_type(&bindings, "uniffi_test_crate_fn_func_get_i8"),
+            "Byte"
+        );
+        assert_eq!(
+            ffi_return_type(&bindings, "uniffi_test_crate_fn_func_get_i16"),
+            "Short"
+        );
+        // The upper bits of the widened carrier are unspecified on AArch64, where Rust currently
+        // sign-extends, so only the low 16 bits may be compared.
+        assert!(
+            bindings.contains("if ((uniffi_test_crate_checksum_func_get_u16() and 0xffff) != "),
+            "checksum comparisons should mask the widened Int carrier to 16 bits"
+        );
+        assert_eq!(
+            ffi_return_type(&bindings, "uniffi_test_crate_fn_func_get_port"),
+            "Int"
+        );
+        assert!(
+            bindings.contains("fun lift(value: Int): Port {"),
+            "custom types over u16 need a lift for the widened Int carrier"
+        );
+    }
+}
