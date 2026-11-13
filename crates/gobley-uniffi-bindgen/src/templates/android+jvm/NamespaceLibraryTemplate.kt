@@ -66,11 +66,61 @@ internal typealias {{ ffi_struct.name()|ffi_struct_name }}UniffiByValue = {{ ffi
 @Synchronized
 private fun findLibraryName(componentName: String): String {
     val libOverride = System.getProperty("uniffi.component.$componentName.libraryOverride")
+    {%- if module_name == "jvm" %}
+    findBundledLibrary(libOverride ?: "{{ config.cdylib_name() }}")?.let { return it }
+    {%- endif %}
     if (libOverride != null) {
         return libOverride
     }
     return "{{ config.cdylib_name() }}"
 }
+{%- if module_name == "jvm" %}
+
+// The absolute path of the library `name` bundled in the class path, extracted to a temporary file
+// when it is inside a JAR file, or null without a bundled library for the platform. JNA looks a
+// library up in the system library paths before the class path, and on macOS and Windows these
+// include the working directory, so a library with the same name placed there would be loaded
+// instead of the bundled one. Loading the bundled library by its absolute path skips that lookup.
+//
+// The namespaces that load the same library, by `cdylib_name` or by `libraryOverride`, load the same
+// file. Each extracted copy would be loaded as a library of its own, and the callback interfaces one
+// namespace registers would be missing from the copy of another. The bindings of the namespaces have
+// no code in common, so the path is kept in a system property, one for each class loader as in JNA's
+// cache of loaded libraries. The interned name of the property is the same object in all of them, and
+// is the lock for extracting the library once.
+private fun findBundledLibrary(name: String): String? {
+    if (java.io.File(name).isAbsolute) return null
+    val classLoader = UniffiLib::class.java.classLoader
+    val property = "gobley.library.$name.path@${System.identityHashCode(classLoader)}".intern()
+    synchronized(property) {
+        System.getProperty(property)?.let { return it }
+        val library = try {
+            Native.extractFromResourcePath(name, classLoader)
+        } catch (_: java.io.IOException) {
+            null
+        } ?: return null
+        extractedLibrary = library
+        System.setProperty(property, library.absolutePath)
+        return library.absolutePath
+    }
+}
+
+// The file the bindings of this namespace found the bundled library in.
+private var extractedLibrary: java.io.File? = null
+
+// Deletes the temporary file JNA extracted the bundled library to once the library is loaded, as JNA
+// does for the libraries it extracts itself. JNA keeps the library open under its path, so the
+// namespaces that load it afterwards need no file. Windows can't delete a loaded library: the marker
+// file makes JNA delete it the next time it starts.
+private fun deleteExtractedBundledLibrary() {
+    val library = extractedLibrary ?: return
+    if (!Regex("jna-?\\d+\\.(tmp|dll)").matches(library.name) || library.delete()) return
+    try {
+        java.io.File(library.parentFile, library.name + ".x").createNewFile()
+    } catch (_: java.io.IOException) {
+    }
+}
+{%- endif %}
 
 {%- if config.enable_jna_interface_mapping() %}
 private inline fun <reified Lib : Library> loadIndirect(componentName: String): Lib {
@@ -280,7 +330,11 @@ internal interface UniffiLib : Library {
             )
             {%- endif %}
             IntegrityCheckingUniffiLib
+            {%- if module_name == "jvm" %}
+            loadIndirect<UniffiLib>("{{ ci.namespace() }}").also { deleteExtractedBundledLibrary() }
+            {%- else %}
             loadIndirect("{{ ci.namespace() }}")
+            {%- endif %}
         }
     ) {
         init {
@@ -304,6 +358,9 @@ internal object UniffiLib : Library {
         {%- endif %}
         IntegrityCheckingUniffiLib
         Native.register(UniffiLib::class.java, findLibraryName("{{ ci.namespace() }}"))
+        {%- if module_name == "jvm" %}
+        deleteExtractedBundledLibrary()
+        {%- endif %}
         // No need to check the contract version and checksums, since 
         // we already did that with `IntegrityCheckingUniffiLib` above.
         {%- for init_fn in self.initialization_fns(ci) %}
